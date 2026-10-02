@@ -13,7 +13,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/MuhammadAnsoriNasution/react-native-thermal-printer"
+    "url": "https://github.com/OxbridgeTechnology/react-native-thermal-printer"
   },
   "files": [
     "dist",
@@ -59,6 +59,6 @@
     "react-native-ping": "*"
   },
   "author": "MuhammadAnsoriNasution",
-  "homepage": "https://github.com/MuhammadAnsoriNasution/react-native-thermal-printer#readme",
+  "homepage": "https://github.com/OxbridgeTechnology/react-native-thermal-printer#readme",
   "license": "ISC"
 }
