@@ -47,8 +47,15 @@ public class UtilsImage {
         return image;
     }
 
+    // Pixels darker than this luminance (0-255) are printed black.
+    // Kept below the 127 midpoint because images are sent as one
+    // continuous raster: the head stays hot and dots bleed, so a lower
+    // threshold (fewer black dots) compensates for prints coming out
+    // too dark. Lower = lighter print.
+    private static final int PRINT_THRESHOLD = 100;
+
     public static boolean shouldPrintColor(int col) {
-        final int threshold = 127;
+        final int threshold = PRINT_THRESHOLD;
         int a, r, g, b, luminance;
         a = (col >> 24) & 0xff;
         if (a != 0xff) {// Ignore transparencies
