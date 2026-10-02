@@ -1,4 +1,4 @@
-# @muhammadansorinasution/react-native-thermal-printer
+# @oxbridgetechnology/react-native-thermal-printer
 
 ![npm](https://img.shields.io/npm/dw/react-native-thermal-receipt-printer-image-qr?logo=github)
 ![npm](https://img.shields.io/npm/v/react-native-thermal-receipt-printer-image-qr?color=green&logo=npm&logoColor=green)
@@ -23,14 +23,14 @@
 ## Installation
 
 ```
-npm i @muhammadansorinasution/react-native-thermal-printer
+npm i github:OxbridgeTechnology/react-native-thermal-printer
 npm i react-native-ping
 ```
 
 or
 
 ```
-yarn add @muhammadansorinasution/react-native-thermal-printer
+yarn add github:OxbridgeTechnology/react-native-thermal-printer
 yarn add react-native-ping
 ```
 
@@ -41,7 +41,7 @@ next step
 cd ios && pod install
 
 # RN < 0.60
-react-native link @muhammadansorinasution/react-native-thermal-printer
+react-native link @oxbridgetechnology/react-native-thermal-printer
 ```
 
 ## API Reference
@@ -92,7 +92,7 @@ import {
 } from "react-native-thermal-printer";
 ```
 
-[See more here](https://github.com/MuhammadAnsoriNasution/react-native-thermal-printer/blob/main/dist/utils/printer-commands.js)
+[See more here](https://github.com/OxbridgeTechnology/react-native-thermal-printer/blob/main/dist/utils/printer-commands.js)
 
 ## Example
 
@@ -147,7 +147,7 @@ Printer.printImage(
 );
 ```
 
-[See more here](https://github.com/MuhammadAnsoriNasution/react-native-thermal-printer/blob/main/example/src/HomeScreen.tsx)
+[See more here](https://github.com/OxbridgeTechnology/react-native-thermal-printer/blob/main/example/src/HomeScreen.tsx)
 
 ## Troubleshoot
 
@@ -263,7 +263,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import {
     BLEPrinter,
     IBLEPrinter,
-} from "@muhammadansorinasution/react-native-thermal-printer";
+} from "@oxbridgetechnology/react-native-thermal-printer";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function HomeScreen() {
