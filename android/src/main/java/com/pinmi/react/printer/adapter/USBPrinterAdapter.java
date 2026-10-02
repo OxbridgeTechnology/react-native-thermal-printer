@@ -37,25 +37,15 @@ import java.util.List;
 /**
  * USB thermal printer adapter.
  *
- * Image printing uses ESC/POS GS v 0 (raster mode), sent in bands
- * (ROWS_PER_BAND rows at a time) rather than one giant continuous
- * block. Sending the whole image as a single raster block caused the
- * print head to receive data faster than the firmware could dissipate
- * heat, especially on dense/dark images — this led to firmware
- * buffer saturation and a visible thermal shift mid-print on cheap
- * ESC/POS clones.
+ * Image printing uses ESC/POS GS v 0 (raster mode) and sends the whole
+ * image as one continuous raster command with no pauses, so the print
+ * head never stops mid-image (stopping leaves white lines).
  *
- * Sending in bands with an adaptive delay (proportional to how much
- * of the band is black) gives the print head time to cool between
- * bands, roughly mimicking what a well-behaved printer firmware would
- * do internally via thermal throttling.
  *
  * bulkTransfer() is still chunked internally (MAX_USB_CHUNK) purely as
  * a safety measure against a known Android USB host bug where single
  * transfers above ~16KB can silently truncate on some devices/kernels
- * - this is a separate, transport-level concern from the band pacing
- * above, and the two work together (band -> paced by heat, chunk ->
- * paced by USB transfer safety).
+ * - this chunking is transparent to the printer.
  */
 public class USBPrinterAdapter implements PrinterAdapter {
 
@@ -68,18 +58,8 @@ public class USBPrinterAdapter implements PrinterAdapter {
 
     // Safe chunk size for bulkTransfer(); well under the ~16KB threshold
     // where some Android USB host stacks silently truncate transfers.
-    private static final int MAX_USB_CHUNK = 1024;
+    private static final int MAX_USB_CHUNK = 4096;
 
-    // How many raster rows to send per band. Smaller = more frequent
-    // cooldown pauses = safer for the thermal head, but slower print.
-    private static final int ROWS_PER_BAND = 24;
-
-    // Fixed delay applied after every band, regardless of content.
-    private static final int BASE_BAND_DELAY_MS = 15;
-
-    // Extra delay (ms), scaled by how much of the band is black.
-    // A fully black band gets BASE_BAND_DELAY_MS + this much extra.
-    private static final int DARKNESS_DELAY_FACTOR_MS = 40;
 
     private Context mContext;
     private UsbManager mUSBManager;
@@ -610,10 +590,9 @@ public class USBPrinterAdapter implements PrinterAdapter {
     /**
      * Sends a (possibly large) buffer as a sequence of bulkTransfer()
      * calls, each capped at MAX_USB_CHUNK. This is purely a transport-
-     * level safety measure against USB host truncation — it does not
-     * by itself protect the print head from overheating. Thermal
-     * safety comes from writeRasterInBands() below, which paces data
-     * by content density, not just by byte count.
+     * level safety measure against USB host truncation; the printer
+     * still receives one continuous stream. No sleeps here: pausing
+     * mid-image starves the printer and produces white lines.
      */
     private boolean writeUsb(
             byte[] data
@@ -641,104 +620,62 @@ public class USBPrinterAdapter implements PrinterAdapter {
             }
 
             offset += length;
-
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         }
 
         return true;
     }
 
     // ---------------------------------------------------------
-    // ESC/POS GS v 0 — BAND-BASED RASTER WITH ADAPTIVE DELAY
+    // ESC/POS GS v 0 FULL RASTER BUILDER
     // ---------------------------------------------------------
 
     /**
-     * Sends the image as a sequence of GS v 0 raster bands
-     * (ROWS_PER_BAND rows each) instead of one continuous block.
-     *
-     * Each band is followed by a delay proportional to how much of
-     * that band is black ink. This gives the thermal head time to
-     * dissipate heat between bands, preventing the firmware buffer
-     * saturation / thermal drift seen when the full image was sent
-     * as a single uninterrupted raster stream.
-     *
-     * Returns false if any band fails to transfer over USB.
+     * Builds a single GS v 0 raster command containing the entire
+     * image. The printer receives width/height once and then a
+     * continuous bit-packed pixel stream, so the head prints in one
+     * uninterrupted pass. Splitting the image into separate bands or
+     * pausing between writes lets the printer run out of data
+     * mid-image; the paper motor then stops and restarts, which shows
+     * up as thin white lines across the print.
      */
-    private boolean writeRasterInBands(
-            int[][] pixels
-    ) {
+    private byte[] buildFullRasterImage(int[][] pixels) {
 
         if (pixels == null || pixels.length == 0) {
-            return true;
+            return null;
         }
 
         int height = pixels.length;
         int width = pixels[0].length;
-        int widthBytes = (width + 7) / 8;
+        int widthBytes = (width + 7) / 8; // 1 bit per pixel, MSB first
 
-        for (int startY = 0; startY < height; startY += ROWS_PER_BAND) {
+        ByteArrayOutputStream buffer =
+                new ByteArrayOutputStream(8 + (widthBytes * height));
 
-            int bandHeight = Math.min(ROWS_PER_BAND, height - startY);
+        // GS v 0 m xL xH yL yH
+        buffer.write(0x1D); // GS
+        buffer.write(0x76); // v
+        buffer.write(0x30); // 0
+        buffer.write(0x00); // m = normal mode, no scaling
+        buffer.write(widthBytes & 0xFF);        // xL
+        buffer.write((widthBytes >> 8) & 0xFF); // xH
+        buffer.write(height & 0xFF);            // yL
+        buffer.write((height >> 8) & 0xFF);     // yH
 
-            ByteArrayOutputStream bandBuffer =
-                    new ByteArrayOutputStream(8 + (widthBytes * bandHeight));
-
-            // GS v 0 header, re-sent per band. Each band is a
-            // self-contained raster command the printer executes
-            // and then waits for the next one — this is what lets
-            // us pace delivery instead of dumping it all at once.
-            bandBuffer.write(0x1D);
-            bandBuffer.write(0x76);
-            bandBuffer.write(0x30);
-            bandBuffer.write(0x00);
-            bandBuffer.write(widthBytes & 0xFF);
-            bandBuffer.write((widthBytes >> 8) & 0xFF);
-            bandBuffer.write(bandHeight & 0xFF);
-            bandBuffer.write((bandHeight >> 8) & 0xFF);
-
-            long blackBits = 0;
-            long totalBits = (long) width * bandHeight;
-
-            for (int y = startY; y < startY + bandHeight; y++) {
-                int[] row = pixels[y];
-                for (int bx = 0; bx < widthBytes; bx++) {
-                    byte b = 0;
-                    for (int bit = 0; bit < 8; bit++) {
-                        int x = bx * 8 + bit;
-                        if (x < width) {
-                            boolean black = UtilsImage.shouldPrintColor(row[x]);
-                            if (black) {
-                                b |= (byte) (1 << (7 - bit));
-                                blackBits++;
-                            }
-                        }
+        for (int y = 0; y < height; y++) {
+            int[] row = pixels[y];
+            for (int bx = 0; bx < widthBytes; bx++) {
+                byte b = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    int x = bx * 8 + bit;
+                    if (x < width && UtilsImage.shouldPrintColor(row[x])) {
+                        b |= (byte) (1 << (7 - bit));
                     }
-                    bandBuffer.write(b);
                 }
-            }
-
-            if (!writeUsb(bandBuffer.toByteArray())) {
-                return false;
-            }
-
-            double darknessRatio =
-                    totalBits == 0 ? 0 : (double) blackBits / totalBits;
-
-            int adaptiveDelay = BASE_BAND_DELAY_MS
-                    + (int) (darknessRatio * DARKNESS_DELAY_FACTOR_MS);
-
-            try {
-                Thread.sleep(adaptiveDelay);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                buffer.write(b);
             }
         }
 
-        return true;
+        return buffer.toByteArray();
     }
 
     // ---------------------------------------------------------
@@ -927,20 +864,7 @@ public class USBPrinterAdapter implements PrinterAdapter {
             if (!writeUsb(CENTER_ALIGN)) {
                 throw new IOException("Failed to set alignment");
             }
-
-            Log.i(
-                    LOG_TAG,
-                    "Sending raster image in bands of " + ROWS_PER_BAND
-                            + " rows, with adaptive cooldown delay "
-                            + "to protect the thermal head"
-            );
-
-            // Sends the image band-by-band with an adaptive delay based
-            // on ink density, instead of one giant continuous raster
-            // block. This prevents firmware buffer saturation and the
-            // thermal drift observed when too much data was pushed to
-            // the printer without giving the head time to cool.
-            if (!writeRasterInBands(pixels)) {
+            if (!writeUsb(buildFullRasterImage(pixels))) {
                 throw new IOException("USB raster transfer failed");
             }
 

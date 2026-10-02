@@ -28,18 +28,9 @@ import java.util.UUID;
 /**
  * Bluetooth (RFCOMM/SPP) thermal printer adapter.
  *
- * Image printing uses ESC/POS GS v 0 (raster mode), sent in bands
- * (ROWS_PER_BAND rows at a time) rather than one giant continuous
- * block. Sending the whole image as a single raster block caused the
- * print head to receive data faster than the firmware could dissipate
- * heat, especially on dense/dark images — this led to firmware
- * buffer saturation and a visible thermal shift mid-print on cheap
- * ESC/POS clones (e.g. iWare J828BT, Mijia Desktop Photo Printer 2).
- *
- * Sending in bands with an adaptive delay (proportional to how much
- * of the band is black) gives the print head time to cool between
- * bands, roughly mimicking what a well-behaved printer firmware would
- * do internally via thermal throttling.
+ * Image printing uses ESC/POS GS v 0 (raster mode) and sends the whole
+ * image as one continuous raster command with no pauses, so the print
+ * head never stops mid-image (stopping leaves white lines).
  */
 public class BLEPrinterAdapter implements PrinterAdapter {
 
@@ -288,24 +279,13 @@ public class BLEPrinterAdapter implements PrinterAdapter {
 
     private static final int WRITE_CHUNK_SIZE = 512;
 
-    // How many raster rows to send per band. Smaller = more frequent
-    // cooldown pauses = safer for the thermal head, but slower print.
-    private static final int ROWS_PER_BAND = 24;
-
-    // Fixed delay applied after every band, regardless of content.
-    private static final int BASE_BAND_DELAY_MS = 15;
-
-    // Extra delay (ms), scaled by how much of the band is black.
-    // A fully black band gets BASE_BAND_DELAY_MS + this much extra.
-    private static final int DARKNESS_DELAY_FACTOR_MS = 40;
 
     /**
      * Writes a (possibly large) buffer as a sequence of write() calls,
      * each capped at WRITE_CHUNK_SIZE. This is purely a transport-level
-     * safety measure for RFCOMM — it does not by itself protect the
-     * print head from overheating. Thermal safety comes from
-     * writeRasterInBands() below, which paces data by content density,
-     * not just by byte count.
+     * safety measure for RFCOMM; the printer still receives one
+     * continuous stream. No sleeps here: pausing mid-image starves the
+     * printer and produces white lines.
      */
     private void writeBluetooth(
             OutputStream outputStream,
@@ -326,98 +306,60 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             outputStream.flush();
 
             offset += length;
-
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         }
     }
 
     // ---------------------------------------------------------
-    // ESC/POS GS v 0 — BAND-BASED RASTER WITH ADAPTIVE DELAY
+    // ESC/POS GS v 0 FULL RASTER BUILDER
     // ---------------------------------------------------------
 
     /**
-     * Sends the image as a sequence of GS v 0 raster bands
-     * (ROWS_PER_BAND rows each) instead of one continuous block.
-     *
-     * Each band is followed by a delay proportional to how much of
-     * that band is black ink. This gives the thermal head time to
-     * dissipate heat between bands, preventing the firmware buffer
-     * saturation / thermal drift seen when the full image was sent
-     * as a single uninterrupted raster stream.
+     * Builds a single GS v 0 raster command containing the entire
+     * image. The printer receives width/height once and then a
+     * continuous bit-packed pixel stream, so the head prints in one
+     * uninterrupted pass. Splitting the image into separate bands or
+     * pausing between writes lets the printer run out of data
+     * mid-image; the paper motor then stops and restarts, which shows
+     * up as thin white lines across the print.
      */
-    private void writeRasterInBands(
-            OutputStream outputStream,
-            int[][] pixels
-    ) throws IOException {
+    private byte[] buildFullRasterImage(int[][] pixels) {
 
         if (pixels == null || pixels.length == 0) {
-            return;
+            return null;
         }
 
         int height = pixels.length;
         int width = pixels[0].length;
-        int widthBytes = (width + 7) / 8;
+        int widthBytes = (width + 7) / 8; // 1 bit per pixel, MSB first
 
-        for (int startY = 0; startY < height; startY += ROWS_PER_BAND) {
+        ByteArrayOutputStream buffer =
+                new ByteArrayOutputStream(8 + (widthBytes * height));
 
-            int bandHeight = Math.min(ROWS_PER_BAND, height - startY);
+        // GS v 0 m xL xH yL yH
+        buffer.write(0x1D); // GS
+        buffer.write(0x76); // v
+        buffer.write(0x30); // 0
+        buffer.write(0x00); // m = normal mode, no scaling
+        buffer.write(widthBytes & 0xFF);        // xL
+        buffer.write((widthBytes >> 8) & 0xFF); // xH
+        buffer.write(height & 0xFF);            // yL
+        buffer.write((height >> 8) & 0xFF);     // yH
 
-            ByteArrayOutputStream bandBuffer =
-                    new ByteArrayOutputStream(8 + (widthBytes * bandHeight));
-
-            // GS v 0 header, re-sent per band. Each band is a
-            // self-contained raster command the printer executes
-            // and then waits for the next one — this is what lets
-            // us pace delivery instead of dumping it all at once.
-            bandBuffer.write(0x1D);
-            bandBuffer.write(0x76);
-            bandBuffer.write(0x30);
-            bandBuffer.write(0x00);
-            bandBuffer.write(widthBytes & 0xFF);
-            bandBuffer.write((widthBytes >> 8) & 0xFF);
-            bandBuffer.write(bandHeight & 0xFF);
-            bandBuffer.write((bandHeight >> 8) & 0xFF);
-
-            long blackBits = 0;
-            long totalBits = (long) width * bandHeight;
-
-            for (int y = startY; y < startY + bandHeight; y++) {
-                int[] row = pixels[y];
-                for (int bx = 0; bx < widthBytes; bx++) {
-                    byte b = 0;
-                    for (int bit = 0; bit < 8; bit++) {
-                        int x = bx * 8 + bit;
-                        if (x < width) {
-                            boolean black = UtilsImage.shouldPrintColor(row[x]);
-                            if (black) {
-                                b |= (byte) (1 << (7 - bit));
-                                blackBits++;
-                            }
-                        }
+        for (int y = 0; y < height; y++) {
+            int[] row = pixels[y];
+            for (int bx = 0; bx < widthBytes; bx++) {
+                byte b = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    int x = bx * 8 + bit;
+                    if (x < width && UtilsImage.shouldPrintColor(row[x])) {
+                        b |= (byte) (1 << (7 - bit));
                     }
-                    bandBuffer.write(b);
                 }
-            }
-
-            writeBluetooth(outputStream, bandBuffer.toByteArray());
-            outputStream.flush();
-
-            double darknessRatio =
-                    totalBits == 0 ? 0 : (double) blackBits / totalBits;
-
-            int adaptiveDelay = BASE_BAND_DELAY_MS
-                    + (int) (darknessRatio * DARKNESS_DELAY_FACTOR_MS);
-
-            try {
-                Thread.sleep(adaptiveDelay);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                buffer.write(b);
             }
         }
+
+        return buffer.toByteArray();
     }
 
     // ---------------------------------------------------------
@@ -575,20 +517,7 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             // Center alignment still applies to the raster block on
             // most ESC/POS clones.
             writeBluetooth(outputStream, CENTER_ALIGN);
-
-            Log.i(
-                    LOG_TAG,
-                    "Sending raster image in bands of " + ROWS_PER_BAND
-                            + " rows, with adaptive cooldown delay "
-                            + "to protect the thermal head"
-            );
-
-            // Sends the image band-by-band with an adaptive delay based
-            // on ink density, instead of one giant continuous raster
-            // block. This prevents firmware buffer saturation and the
-            // thermal drift observed when too much data was pushed to
-            // the printer without giving the head time to cool.
-            writeRasterInBands(outputStream, pixels);
+            writeBluetooth(outputStream, buildFullRasterImage(pixels));
 
             // Restore normal line spacing, in case a text print follows
             // this image later in the same connection. Cheap no-op
